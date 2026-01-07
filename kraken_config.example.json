@@ -1,0 +1,28 @@
+{
+  "kraken": {
+    "apiKey": "YOUR_KRAKEN_API_KEY_HERE",
+    "apiSecret": "YOUR_KRAKEN_API_SECRET_HERE"
+  },
+  "trading": {
+    "quoteCurrency": "USD",
+    "maxPositionSizePercent": 5,
+    "stopLossPercent": 2,
+    "takeProfitPercent": 4,
+    "minNotionalUsd": 10,
+    "cycleSeconds": 60
+  },
+  "assets": {
+    "crypto": [
+      "XXBTZUSD",
+      "XETHZUSD",
+      "SOLUSD",
+      "ADAUSD",
+      "MATICUSD",
+      "AVAXUSD",
+      "DOTUSD",
+      "LINKUSD",
+      "UNIUSD",
+      "ATOMUSD"
+    ]
+  }
+}
