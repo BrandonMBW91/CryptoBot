@@ -3,6 +3,12 @@
     "apiKey": "YOUR_KRAKEN_API_KEY_HERE",
     "apiSecret": "YOUR_KRAKEN_API_SECRET_HERE"
   },
+  "discord": {
+    "webhookTrading": "YOUR_DISCORD_WEBHOOK_URL_FOR_TRADES",
+    "webhookErrors": "YOUR_DISCORD_WEBHOOK_URL_FOR_ERRORS",
+    "webhookDailySummary": "YOUR_DISCORD_WEBHOOK_URL_FOR_DAILY_SUMMARY",
+    "dailySummaryTime": "10:00"
+  },
   "trading": {
     "quoteCurrency": "USD",
     "maxPositionSizePercent": 5,

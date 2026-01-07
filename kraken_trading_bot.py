@@ -24,7 +24,8 @@ from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-from coinbase_dashboard import dashboard
+from dashboard import dashboard
+from discord_notifier import DiscordNotifier
 
 
 # Set up logging
@@ -121,6 +122,7 @@ class KrakenClient:
         self.api_url = "https://api.kraken.com"
         self.last_request_time = 0
         self.min_request_interval = 1.0  # Kraken rate limit
+        self.config = config  # Store config reference
 
         logger.info("Kraken client initialized")
 
@@ -196,8 +198,22 @@ class KrakenClient:
             usd_balance = float(balance.get('ZUSD', 0))
             total_usd += usd_balance
 
-            # Add crypto values (would need prices to convert)
-            # For now, just use USD balance
+            # Add crypto values by getting current prices
+            for currency, amount in balance.items():
+                amount_float = float(amount)
+                if amount_float > 0 and currency not in ['ZUSD', 'USD']:
+                    # Find matching trading pair
+                    for symbol in self.config.assets.get('crypto', []):
+                        if symbol.startswith(currency) or symbol.startswith('X' + currency) or symbol.startswith('Z' + currency):
+                            try:
+                                current_price = self.get_ticker(symbol)
+                                if current_price:
+                                    crypto_value = amount_float * current_price
+                                    total_usd += crypto_value
+                                    logger.debug(f"Added {currency}: {amount_float:.4f} @ ${current_price:.4f} = ${crypto_value:.2f}")
+                                    break
+                            except Exception as e:
+                                logger.error(f"Error getting price for {symbol}: {e}")
 
             return {
                 'equity': total_usd,
@@ -645,9 +661,48 @@ class TradingEngine:
         self.initial_equity = 0
         self.positions = {}
 
+        # Discord notifiers
+        discord_config = self.config.config.get('discord', {})
+        self.discord_trading = DiscordNotifier(discord_config.get('webhookTrading', ''))
+        self.discord_errors = DiscordNotifier(discord_config.get('webhookErrors', ''))
+        self.discord_summary = DiscordNotifier(discord_config.get('webhookDailySummary', ''))
+        self.daily_summary_time = discord_config.get('dailySummaryTime', '10:00')
+        self.last_summary_date = None
+
         # Dashboard thread
         self.dashboard_thread = None
         self.dashboard_running = False
+
+    def _recover_positions(self):
+        """Recover open positions from Kraken account"""
+        try:
+            balance = self.client._private_request('Balance')
+            logger.info("Recovering open positions from account...")
+
+            for currency, amount in balance.items():
+                amount_float = float(amount)
+                if amount_float > 0 and currency not in ['ZUSD', 'USD']:
+                    # This is a crypto position - try to find matching symbol
+                    for symbol in self.products:
+                        # Match currency to symbol (e.g., APE -> APEUSD)
+                        if symbol.startswith(currency) or symbol.startswith('X' + currency) or symbol.startswith('Z' + currency):
+                            # Get current price
+                            current_price = self.client.get_ticker(symbol)
+                            if current_price:
+                                # We don't know the entry price, so use current price
+                                # This means unrealized P/L will be 0 until we track it
+                                self.positions[symbol] = {
+                                    'symbol': symbol,
+                                    'qty': amount_float,
+                                    'avg_entry_price': current_price,  # Unknown, using current
+                                    'current_price': current_price,
+                                    'unrealized_pl': 0,
+                                    'unrealized_plpc': 0
+                                }
+                                logger.info(f"Recovered position: {symbol} - {amount_float:.4f} @ ${current_price:.4f}")
+                                break
+        except Exception as e:
+            logger.error(f"Error recovering positions: {e}")
 
     def initialize(self):
         """Initialize engine"""
@@ -656,6 +711,9 @@ class TradingEngine:
         # Get account info
         account = self.client.get_account()
         self.initial_equity = account['equity']
+
+        # Recover any open positions from account
+        self._recover_positions()
 
         # Update dashboard platform name
         dashboard.platform_name = 'KRAKEN'
@@ -670,6 +728,12 @@ class TradingEngine:
 
         logger.info(f"Bot started - Equity: ${self.initial_equity:.2f}")
 
+        # Send Discord startup notification
+        self.discord_trading.send_startup_notification(
+            equity=self.initial_equity,
+            symbols=self.products
+        )
+
     def _update_dashboard_loop(self):
         """Dashboard update loop"""
         while self.dashboard_running:
@@ -678,6 +742,43 @@ class TradingEngine:
                 time.sleep(1)
             except Exception as e:
                 logger.error(f"Dashboard error: {e}")
+
+    def _check_daily_summary(self):
+        """Check if it's time to send daily summary"""
+        try:
+            now = datetime.now()
+            current_date = now.date()
+            current_time = now.strftime('%H:%M')
+
+            # Check if we haven't sent summary today and it's past the scheduled time
+            if self.last_summary_date != current_date:
+                target_hour, target_minute = map(int, self.daily_summary_time.split(':'))
+                if now.hour > target_hour or (now.hour == target_hour and now.minute >= target_minute):
+                    # Get current account info
+                    account = self.client.get_account()
+                    equity = account.get('equity', 0)
+                    daily_pl = equity - self.initial_equity
+                    daily_pl_percent = (daily_pl / self.initial_equity * 100) if self.initial_equity > 0 else 0
+
+                    # Get stats
+                    stats = self.portfolio_tracker.get_daily_stats()
+
+                    # Build portfolio dict
+                    portfolio = {
+                        'equity': equity,
+                        'daily_pl': daily_pl,
+                        'daily_pl_percent': daily_pl_percent,
+                        'positions': len(self.positions)
+                    }
+
+                    # Send Discord daily summary
+                    self.discord_summary.send_daily_summary(stats, portfolio)
+                    self.last_summary_date = current_date
+                    logger.info(f"Daily summary sent at {current_time}")
+
+        except Exception as e:
+            logger.error(f"Error sending daily summary: {e}")
+            self.discord_errors.send_error_alert('Daily Summary Error', str(e))
 
     def analyze_symbol(self, symbol: str):
         """Analyze symbol"""
@@ -708,6 +809,7 @@ class TradingEngine:
 
         except Exception as e:
             logger.error(f"Error analyzing {symbol}: {e}")
+            self.discord_errors.send_error_alert('Analysis Error', str(e), symbol)
 
     def execute_buy(self, symbol: str, signal: Dict, bars: pd.DataFrame):
         """Execute buy"""
@@ -734,6 +836,7 @@ class TradingEngine:
                     'symbol': symbol,
                     'qty': qty,
                     'avg_entry_price': signal['price'],
+                    'current_price': signal['price'],
                     'unrealized_pl': 0,
                     'unrealized_plpc': 0
                 }
@@ -748,8 +851,19 @@ class TradingEngine:
 
                 logger.info(f"BUY {symbol}: {qty:.4f} @ ${signal['price']:.2f}")
 
+                # Send Discord trade notification
+                self.discord_trading.send_trade_notification(
+                    trade_type='BUY',
+                    symbol=symbol,
+                    qty=qty,
+                    price=signal['price'],
+                    strength=signal['strength'],
+                    confirmations=signal.get('confirmations', [])
+                )
+
         except Exception as e:
             logger.error(f"Failed to execute buy: {e}")
+            self.discord_errors.send_error_alert('Buy Order Failed', str(e), symbol)
         finally:
             self.risk_manager.release_lock(symbol)
 
@@ -769,6 +883,11 @@ class TradingEngine:
             if order:
                 self.portfolio_tracker.record_exit(symbol, exit_price, qty)
                 self.risk_manager.record_trade_result(is_win)
+
+                # Calculate P/L for Discord notification
+                pl = (exit_price - entry_price) * qty
+                pl_percent = ((exit_price - entry_price) / entry_price) * 100
+
                 del self.positions[symbol]
 
                 # Add to dashboard
@@ -781,11 +900,46 @@ class TradingEngine:
 
                 logger.info(f"SELL {symbol}: {qty:.4f} @ ${exit_price:.2f} - {'WIN' if is_win else 'LOSS'}")
 
+                # Send Discord position closed notification
+                self.discord_trading.send_position_closed(
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    pl=pl,
+                    pl_percent=pl_percent
+                )
+
         except Exception as e:
             logger.error(f"Failed to execute sell: {e}")
+            self.discord_errors.send_error_alert('Sell Order Failed', str(e), symbol)
+
+    def _update_position_prices(self):
+        """Update current prices for all open positions"""
+        for symbol in list(self.positions.keys()):
+            try:
+                current_price = self.client.get_ticker(symbol)
+                if current_price:
+                    position = self.positions[symbol]
+                    entry_price = position['avg_entry_price']
+                    qty = position['qty']
+                    unrealized_pl = (current_price - entry_price) * qty
+                    unrealized_plpc = ((current_price - entry_price) / entry_price) * 100
+
+                    self.positions[symbol]['current_price'] = current_price
+                    self.positions[symbol]['unrealized_pl'] = unrealized_pl
+                    self.positions[symbol]['unrealized_plpc'] = unrealized_plpc
+            except Exception as e:
+                logger.error(f"Error updating price for {symbol}: {e}")
 
     def run_analysis_cycle(self):
         """Run analysis cycle"""
+        # Check if it's time for daily summary
+        self._check_daily_summary()
+
+        # Update current prices for open positions
+        self._update_position_prices()
+
         # Update account
         account = self.client.get_account()
         equity = account.get('equity', 0)
@@ -883,6 +1037,17 @@ class TradingEngine:
             self.dashboard_thread.join(timeout=2)
         dashboard.destroy()
         logger.info("Bot stopped")
+
+        # Send Discord shutdown notification
+        try:
+            account = self.client.get_account()
+            stats = self.portfolio_tracker.get_daily_stats()
+            self.discord_trading.send_shutdown_notification(
+                equity=account.get('equity', 0),
+                stats=stats
+            )
+        except Exception as e:
+            logger.error(f"Error sending shutdown notification: {e}")
 
 
 def main():
