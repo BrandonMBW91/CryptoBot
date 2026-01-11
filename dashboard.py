@@ -273,12 +273,19 @@ class CoinbaseDashboard:
                     if pos_index < len(self.trading_data['positions']):
                         pos = self.trading_data['positions'][pos_index]
                         pl = pos['unrealized_pl']
-                        pl_percent = pos['unrealized_plpc'] * 100
+                        pl_percent = pos['unrealized_plpc']
                         pl_color = Colors.GREEN if pl >= 0 else Colors.RED
                         pl_icon = '📈' if pl >= 0 else '📉'
 
+                        # Format quantity with appropriate decimals (4 decimals for small amounts)
+                        qty = pos['qty']
+                        if qty < 0.01:
+                            qty_str = f"{qty:<6.4f}"
+                        else:
+                            qty_str = f"{qty:<6.2f}"
+
                         left_content = (f"{pl_icon} {Colors.YELLOW}{pos['symbol']:<6}{Colors.RESET} "
-                                      f"{Colors.WHITE}{pos['qty']:<6.2f}{Colors.RESET} "
+                                      f"{Colors.WHITE}{qty_str}{Colors.RESET} "
                                       f"{Colors.WHITE}${pos['avg_entry_price']:<8.2f}{Colors.RESET} "
                                       f"{pl_color}{'+' if pl >= 0 else ''}${pl:<9.2f}{Colors.RESET} "
                                       f"{pl_color}{'+' if pl_percent >= 0 else ''}{pl_percent:.1f}%{Colors.RESET}")

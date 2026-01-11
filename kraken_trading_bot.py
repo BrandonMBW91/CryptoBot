@@ -307,6 +307,38 @@ class KrakenClient:
             return {}
 
 
+def get_order_info(self, txid: str) -> Optional[Dict]:
+    """Fetch a specific order's details (including executed price/fee when available)."""
+    try:
+        if not txid:
+            return None
+        result = self._private_request('QueryOrders', {'txid': txid})
+        if not result:
+            return None
+        # Kraken returns a dict keyed by txid
+        order = result.get(txid) or next(iter(result.values()))
+        return order
+    except Exception as e:
+        logger.error(f"Failed to query order {txid}: {e}")
+        return None
+
+@staticmethod
+def _extract_fill_price_and_fee(order: Dict) -> Dict[str, float]:
+    """Derive average fill price and fee from an order payload."""
+    try:
+        vol_exec = float(order.get('vol_exec') or 0)
+        cost = float(order.get('cost') or 0)
+        fee = float(order.get('fee') or 0)
+        if vol_exec > 0 and cost > 0:
+            price = cost / vol_exec
+        else:
+            # Fallbacks: sometimes 'price' exists
+            price = float(order.get('price') or 0) or float(order.get('descr', {}).get('price') or 0) or 0.0
+        return {'price': price, 'fee': fee, 'vol_exec': vol_exec, 'cost': cost}
+    except Exception:
+        return {'price': 0.0, 'fee': 0.0, 'vol_exec': 0.0, 'cost': 0.0}
+
+
 class TechnicalAnalysis:
     """Technical analysis calculations"""
 
@@ -592,31 +624,86 @@ class PortfolioTracker:
         self.closed_positions = []
         self.all_time_closed_positions = []
         self.open_positions_entry = {}
+        self.stats_file = 'trading_stats.json'
+        self._load_all_time_stats()
 
-    def record_entry(self, symbol: str, price: float, qty: float):
-        """Record entry"""
+    def _load_all_time_stats(self):
+        """Load all-time statistics from file"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r') as f:
+                    data = json.load(f)
+                    # Convert timestamp strings back to datetime objects
+                    for trade in data.get('all_time_trades', []):
+                        if 'timestamp' in trade and isinstance(trade['timestamp'], str):
+                            trade['timestamp'] = datetime.fromisoformat(trade['timestamp'])
+                    self.all_time_closed_positions = data.get('all_time_trades', [])
+                    logger.info(f"Loaded {len(self.all_time_closed_positions)} all-time trades from {self.stats_file}")
+        except Exception as e:
+            logger.error(f"Error loading all-time stats: {e}")
+            self.all_time_closed_positions = []
+
+    def _save_all_time_stats(self):
+        """Save all-time statistics to file"""
+        try:
+            # Convert datetime objects to ISO format strings for JSON serialization
+            trades_to_save = []
+            for trade in self.all_time_closed_positions:
+                trade_copy = trade.copy()
+                if 'timestamp' in trade_copy and isinstance(trade_copy['timestamp'], datetime):
+                    trade_copy['timestamp'] = trade_copy['timestamp'].isoformat()
+                trades_to_save.append(trade_copy)
+
+            data = {
+                'all_time_trades': trades_to_save,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.stats_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.debug(f"Saved {len(self.all_time_closed_positions)} all-time trades to {self.stats_file}")
+        except Exception as e:
+            logger.error(f"Error saving all-time stats: {e}")
+
+    def record_entry(self, symbol: str, price: float, qty: float, fee: float = 0.0):
+        """Record entry (stores fee so we can compute net P/L on exit)."""
         self.open_positions_entry[symbol] = {
-            'price': price,
-            'qty': qty,
+            'price': float(price),
+            'qty': float(qty),
+            'fee': float(fee or 0.0),
             'timestamp': datetime.now()
         }
 
-    def record_exit(self, symbol: str, exit_price: float, qty: float):
-        """Record exit"""
+    def record_exit(self, symbol: str, exit_price: float, qty: float, fee: float = 0.0) -> Optional[Dict]:
+        """Record exit and return the trade dict."""
         if symbol not in self.open_positions_entry:
-            return
+            return None
 
         entry = self.open_positions_entry[symbol]
-        realized_pl = (exit_price - entry['price']) * qty
-        realized_pl_percent = ((exit_price - entry['price']) / entry['price']) * 100
+        entry_price = float(entry['price'])
+        entry_fee = float(entry.get('fee', 0.0) or 0.0)
+        exit_fee = float(fee or 0.0)
+
+        gross_pl = (float(exit_price) - entry_price) * float(qty)
+        gross_pl_percent = ((float(exit_price) - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
+
+        # Net after fees (what you actually care about)
+        net_pl = gross_pl - (entry_fee + exit_fee)
+        notional = entry_price * float(qty)
+        net_pl_percent = (net_pl / notional * 100) if notional > 0 else 0.0
 
         trade = {
             'symbol': symbol,
-            'entry_price': entry['price'],
-            'exit_price': exit_price,
-            'qty': qty,
-            'pl': realized_pl,
-            'pl_percent': realized_pl_percent,
+            'entry_price': entry_price,
+            'exit_price': float(exit_price),
+            'qty': float(qty),
+            # Keep these names for dashboard compatibility (pl == net_pl)
+            'pl': net_pl,
+            'pl_percent': net_pl_percent,
+            # Extra detail for transparency
+            'gross_pl': gross_pl,
+            'gross_pl_percent': gross_pl_percent,
+            'entry_fee': entry_fee,
+            'exit_fee': exit_fee,
             'timestamp': datetime.now()
         }
 
@@ -624,15 +711,22 @@ class PortfolioTracker:
         self.all_time_closed_positions.append(trade)
         self.open_positions_entry.pop(symbol, None)
 
-        logger.info(f"Realized P/L for {symbol}: ${realized_pl:.2f} ({realized_pl_percent:.2f}%)")
+        # Save all-time stats to file
+        self._save_all_time_stats()
+
+        logger.info(
+            f"Realized P/L for {symbol}: gross ${gross_pl:.2f} ({gross_pl_percent:.2f}%), "
+            f"fees ${entry_fee + exit_fee:.2f}, net ${net_pl:.2f} ({net_pl_percent:.2f}%)"
+        )
+        return trade
 
     def get_daily_stats(self) -> Dict:
         """Get statistics"""
         wins = [t for t in self.closed_positions if t['pl'] > 0]
-        losses = [t for t in self.closed_positions if t['pl'] < 0]
+        losses = [t for t in self.closed_positions if t['pl'] <= 0]
 
         lifetime_wins = [t for t in self.all_time_closed_positions if t['pl'] > 0]
-        lifetime_losses = [t for t in self.all_time_closed_positions if t['pl'] < 0]
+        lifetime_losses = [t for t in self.all_time_closed_positions if t['pl'] <= 0]
 
         return {
             'total_trades': len(self.closed_positions),
@@ -646,8 +740,14 @@ class PortfolioTracker:
             'lifetime_win_rate': (len(lifetime_wins) / len(self.all_time_closed_positions) * 100) if self.all_time_closed_positions else 0
         }
 
+    def reset_daily_stats(self):
+        """Reset daily stats while preserving all-time stats"""
+        logger.info(f"Resetting daily stats. Clearing {len(self.closed_positions)} daily trades. All-time trades: {len(self.all_time_closed_positions)}")
+        self.closed_positions = []
+
 
 class TradingEngine:
+
     """Main trading engine"""
 
     def __init__(self, config_file='kraken_config.json'):
@@ -672,6 +772,9 @@ class TradingEngine:
         # Dashboard thread
         self.dashboard_thread = None
         self.dashboard_running = False
+
+        # Track current day for daily stats reset
+        self.current_day = datetime.now().date()
 
     def _recover_positions(self):
         """Recover open positions from Kraken account"""
@@ -738,10 +841,30 @@ class TradingEngine:
         """Dashboard update loop"""
         while self.dashboard_running:
             try:
+                # Update position prices every 1 second for real-time display
+                self._update_position_prices()
+                # Update dashboard with latest position data
+                dashboard.update_positions(list(self.positions.values()))
+
                 dashboard.render()
                 time.sleep(1)
             except Exception as e:
                 logger.error(f"Dashboard error: {e}")
+
+    def _check_daily_reset(self):
+        """Check if we need to reset daily stats for a new day"""
+        try:
+            current_date = datetime.now().date()
+            if current_date != self.current_day:
+                logger.info(f"New day detected: {current_date}. Resetting daily stats.")
+                self.portfolio_tracker.reset_daily_stats()
+                self.current_day = current_date
+                # Reset initial equity for new day's P/L calculation
+                account = self.client.get_account()
+                self.initial_equity = account['equity']
+                logger.info(f"Daily stats reset. New starting equity: ${self.initial_equity:.2f}")
+        except Exception as e:
+            logger.error(f"Error in daily reset: {e}")
 
     def _check_daily_summary(self):
         """Check if it's time to send daily summary"""
@@ -770,6 +893,16 @@ class TradingEngine:
                         'daily_pl_percent': daily_pl_percent,
                         'positions': len(self.positions)
                     }
+
+                    # === FILE LOGGING: DAILY PERFORMANCE ===
+                    logger.info(
+                        f"DAILY SUMMARY | "
+                        f"Equity: ${equity:.2f} | "
+                        f"Daily P/L: ${daily_pl:+.2f} ({daily_pl_percent:+.2f}%) | "
+                        f"Trades: {stats['total_trades']} | "
+                        f"W/L: {stats['winning_trades']}/{stats['losing_trades']} | "
+                        f"Win Rate: {stats['win_rate']:.1f}%"
+                    )
 
                     # Send Discord daily summary
                     self.discord_summary.send_daily_summary(stats, portfolio)
@@ -822,21 +955,38 @@ class TradingEngine:
         try:
             account = self.client.get_account()
             portfolio_value = account['equity']
-            qty = self.risk_manager.calculate_position_size(signal['price'], portfolio_value)
+            qty = self.risk_manager.calculate_position_size(float(signal['price']), portfolio_value)
 
-            if qty * signal['price'] < self.config.trading.get('minNotionalUsd', 10):
-                self.risk_manager.release_lock(symbol)
+            if qty * float(signal['price']) < self.config.trading.get('minNotionalUsd', 10):
                 return
 
-            # Place order
             order = self.client.place_order(symbol, 'buy', qty)
             if order:
-                self.portfolio_tracker.record_entry(symbol, signal['price'], qty)
+                # Try to use the *actual* filled price/fee (otherwise fee-only losses look like breakeven)
+                fill_price = float(signal['price'])
+                entry_fee = 0.0
+                try:
+                    txid = None
+                    if isinstance(order, dict) and order.get('txid'):
+                        txid_val = order.get('txid')
+                        txid = txid_val[0] if isinstance(txid_val, list) else txid_val
+                    if txid:
+                        time.sleep(2)  # allow Kraken to finalize order details
+                        info = self.client.get_order_info(txid)
+                        if info:
+                            fill = KrakenClient._extract_fill_price_and_fee(info)
+                            if fill.get('price', 0) > 0:
+                                fill_price = float(fill['price'])
+                            entry_fee = float(fill.get('fee', 0.0) or 0.0)
+                except Exception as _e:
+                    logger.debug(f"Could not fetch fill details for BUY {symbol}: {_e}")
+
+                self.portfolio_tracker.record_entry(symbol, fill_price, qty, entry_fee)
                 self.positions[symbol] = {
                     'symbol': symbol,
                     'qty': qty,
-                    'avg_entry_price': signal['price'],
-                    'current_price': signal['price'],
+                    'avg_entry_price': fill_price,
+                    'current_price': fill_price,
                     'unrealized_pl': 0,
                     'unrealized_plpc': 0
                 }
@@ -849,14 +999,17 @@ class TradingEngine:
                     'timestamp': datetime.now().isoformat()
                 })
 
-                logger.info(f"BUY {symbol}: {qty:.4f} @ ${signal['price']:.2f}")
+                # Update dashboard positions immediately
+                dashboard.update_positions(list(self.positions.values()))
+
+                logger.info(f"BUY {symbol}: {qty:.4f} @ ${fill_price:.6f}")
 
                 # Send Discord trade notification
                 self.discord_trading.send_trade_notification(
                     trade_type='BUY',
                     symbol=symbol,
                     qty=qty,
-                    price=signal['price'],
+                    price=fill_price,
                     strength=signal['strength'],
                     confirmations=signal.get('confirmations', [])
                 )
@@ -866,7 +1019,6 @@ class TradingEngine:
             self.discord_errors.send_error_alert('Buy Order Failed', str(e), symbol)
         finally:
             self.risk_manager.release_lock(symbol)
-
     def execute_sell(self, symbol: str, signal: Dict):
         """Execute sell"""
         if symbol not in self.positions:
@@ -874,19 +1026,40 @@ class TradingEngine:
 
         try:
             position = self.positions[symbol]
-            entry_price = position['avg_entry_price']
-            exit_price = signal['price']
-            qty = position['qty']
-            is_win = exit_price > entry_price
+            entry_price = float(position['avg_entry_price'])
+            qty = float(position['qty'])
+
+            # Start with signal price; we'll try to replace with actual fill later
+            exit_price = float(signal['price'])
+            exit_fee = 0.0
 
             order = self.client.place_order(symbol, 'sell', qty)
             if order:
-                self.portfolio_tracker.record_exit(symbol, exit_price, qty)
+                # Try to use the actual filled exit price/fee
+                try:
+                    txid = None
+                    if isinstance(order, dict) and order.get('txid'):
+                        txid_val = order.get('txid')
+                        txid = txid_val[0] if isinstance(txid_val, list) else txid_val
+                    if txid:
+                        time.sleep(2)
+                        info = self.client.get_order_info(txid)
+                        if info:
+                            fill = KrakenClient._extract_fill_price_and_fee(info)
+                            if fill.get('price', 0) > 0:
+                                exit_price = float(fill['price'])
+                            exit_fee = float(fill.get('fee', 0.0) or 0.0)
+                except Exception as _e:
+                    logger.debug(f"Could not fetch fill details for SELL {symbol}: {_e}")
+
+                trade = self.portfolio_tracker.record_exit(symbol, exit_price, qty, exit_fee)
+
+                # Use net P/L (after fees) to determine win/loss
+                is_win = bool(trade and trade.get('pl', 0) > 0)
                 self.risk_manager.record_trade_result(is_win)
 
-                # Calculate P/L for Discord notification
-                pl = (exit_price - entry_price) * qty
-                pl_percent = ((exit_price - entry_price) / entry_price) * 100
+                pl = float(trade.get('pl', 0.0) if trade else 0.0)
+                pl_percent = float(trade.get('pl_percent', 0.0) if trade else 0.0)
 
                 del self.positions[symbol]
 
@@ -898,9 +1071,13 @@ class TradingEngine:
                     'timestamp': datetime.now().isoformat()
                 })
 
-                logger.info(f"SELL {symbol}: {qty:.4f} @ ${exit_price:.2f} - {'WIN' if is_win else 'LOSS'}")
+                # Update dashboard stats immediately
+                stats = self.portfolio_tracker.get_daily_stats()
+                dashboard.update_daily_stats(stats)
 
-                # Send Discord position closed notification
+                logger.info(f"SELL {symbol}: {qty:.4f} @ ${exit_price:.6f} - {'WIN' if is_win else 'LOSS'}")
+
+                # Send Discord position closed notification (net P/L)
                 self.discord_trading.send_position_closed(
                     symbol=symbol,
                     qty=qty,
@@ -916,6 +1093,9 @@ class TradingEngine:
 
     def _update_position_prices(self):
         """Update current prices for all open positions"""
+        if not self.positions:
+            return
+
         for symbol in list(self.positions.keys()):
             try:
                 current_price = self.client.get_ticker(symbol)
@@ -923,17 +1103,33 @@ class TradingEngine:
                     position = self.positions[symbol]
                     entry_price = position['avg_entry_price']
                     qty = position['qty']
+
+                    # Check if this is a dust position (worth less than $1)
+                    position_value = qty * current_price
+                    if position_value < 1.0:
+                        logger.warning(f"Dust position detected: {symbol} - {qty:.6f} @ ${current_price:.2f} = ${position_value:.4f}. Removing from tracking.")
+                        del self.positions[symbol]
+                        continue
+
                     unrealized_pl = (current_price - entry_price) * qty
                     unrealized_plpc = ((current_price - entry_price) / entry_price) * 100
 
                     self.positions[symbol]['current_price'] = current_price
                     self.positions[symbol]['unrealized_pl'] = unrealized_pl
                     self.positions[symbol]['unrealized_plpc'] = unrealized_plpc
+
+                    logger.debug(f"Updated {symbol}: Qty={qty:.6f}, Entry=${entry_price:.6f}, Current=${current_price:.6f}, P/L=${unrealized_pl:.4f} ({unrealized_plpc:.2f}%)")
             except Exception as e:
-                logger.error(f"Error updating price for {symbol}: {e}")
+                # Log at debug level to avoid spam if rate limited
+                logger.debug(f"Error updating price for {symbol}: {e}")
+                # Keep existing price data if update fails
+                continue
 
     def run_analysis_cycle(self):
         """Run analysis cycle"""
+        # Check if we need to reset daily stats for a new day
+        self._check_daily_reset()
+
         # Check if it's time for daily summary
         self._check_daily_summary()
 
