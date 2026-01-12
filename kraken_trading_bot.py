@@ -121,7 +121,7 @@ class KrakenClient:
         self.api_secret = api_secret
         self.api_url = "https://api.kraken.com"
         self.last_request_time = 0
-        self.min_request_interval = 1.0  # Kraken rate limit
+        self.min_request_interval = 1.5  # Kraken rate limit - increased for safety
         self.config = config  # Store config reference
 
         logger.info("Kraken client initialized")
@@ -150,6 +150,15 @@ class KrakenClient:
 
         try:
             response = requests.get(url, params=params or {}, timeout=10)
+
+            # Handle rate limiting specifically
+            if response.status_code == 429:
+                logger.warning(f"Rate limited by Kraken API. Waiting 5 seconds...")
+                time.sleep(5)
+                # Increase the rate limit interval temporarily
+                self.min_request_interval = min(self.min_request_interval * 1.2, 3.0)
+                return {}  # Return empty result instead of raising
+
             response.raise_for_status()
             data = response.json()
 
@@ -157,6 +166,13 @@ class KrakenClient:
                 raise Exception(f"Kraken API error: {data['error']}")
 
             return data.get('result', {})
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                logger.warning(f"Rate limited by Kraken API")
+                time.sleep(5)
+                return {}
+            logger.error(f"Public request error: {e}")
+            raise
         except Exception as e:
             logger.error(f"Public request error: {e}")
             raise
@@ -177,6 +193,15 @@ class KrakenClient:
 
         try:
             response = requests.post(url, headers=headers, data=params, timeout=10)
+
+            # Handle rate limiting specifically
+            if response.status_code == 429:
+                logger.warning(f"Rate limited by Kraken API. Waiting 5 seconds...")
+                time.sleep(5)
+                # Increase the rate limit interval temporarily
+                self.min_request_interval = min(self.min_request_interval * 1.2, 3.0)
+                return {}  # Return empty result instead of raising
+
             response.raise_for_status()
             data = response.json()
 
@@ -184,6 +209,13 @@ class KrakenClient:
                 raise Exception(f"Kraken API error: {data['error']}")
 
             return data.get('result', {})
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                logger.warning(f"Rate limited by Kraken API")
+                time.sleep(5)
+                return {}
+            logger.error(f"Private request error: {e}")
+            raise
         except Exception as e:
             logger.error(f"Private request error: {e}")
             raise
@@ -541,7 +573,7 @@ class TradingStrategy:
                 'rsi': round(rsi, 2),
                 'macd': round(macd['histogram'], 4),
                 'confirmations': confirmations,
-                'volume_ratio': round(volume / avg_volume, 2),
+                'volume_ratio': round(volume / avg_volume, 2) if avg_volume > 0 else 0,
                 'atr': round(atr, 2)
             }
 
@@ -673,14 +705,22 @@ class PortfolioTracker:
             'timestamp': datetime.now()
         }
 
-    def record_exit(self, symbol: str, exit_price: float, qty: float, fee: float = 0.0) -> Optional[Dict]:
+    def record_exit(self, symbol: str, exit_price: float, qty: float, fee: float = 0.0, entry_price_fallback: float = None) -> Optional[Dict]:
         """Record exit and return the trade dict."""
         if symbol not in self.open_positions_entry:
-            return None
+            # If no entry record exists but we have a fallback entry price, create the trade record anyway
+            if entry_price_fallback is not None:
+                logger.warning(f"No entry record for {symbol}, using fallback entry price ${entry_price_fallback:.6f}")
+                entry_price = float(entry_price_fallback)
+                entry_fee = 0.0
+            else:
+                logger.error(f"Cannot record exit for {symbol} - no entry record found and no fallback price provided")
+                return None
+        else:
+            entry = self.open_positions_entry[symbol]
+            entry_price = float(entry['price'])
+            entry_fee = float(entry.get('fee', 0.0) or 0.0)
 
-        entry = self.open_positions_entry[symbol]
-        entry_price = float(entry['price'])
-        entry_fee = float(entry.get('fee', 0.0) or 0.0)
         exit_fee = float(fee or 0.0)
 
         gross_pl = (float(exit_price) - entry_price) * float(qty)
@@ -802,6 +842,8 @@ class TradingEngine:
                                     'unrealized_pl': 0,
                                     'unrealized_plpc': 0
                                 }
+                                # Also record the entry in portfolio tracker so exits can be tracked
+                                self.portfolio_tracker.record_entry(symbol, current_price, amount_float, fee=0.0)
                                 logger.info(f"Recovered position: {symbol} - {amount_float:.4f} @ ${current_price:.4f}")
                                 break
         except Exception as e:
@@ -839,10 +881,15 @@ class TradingEngine:
 
     def _update_dashboard_loop(self):
         """Dashboard update loop"""
+        price_update_counter = 0
         while self.dashboard_running:
             try:
-                # Update position prices every 1 second for real-time display
-                self._update_position_prices()
+                # Update position prices every 5 seconds (not every second) to avoid rate limits
+                if price_update_counter >= 5:
+                    self._update_position_prices()
+                    price_update_counter = 0
+                price_update_counter += 1
+
                 # Update dashboard with latest position data
                 dashboard.update_positions(list(self.positions.values()))
 
@@ -961,58 +1008,61 @@ class TradingEngine:
                 return
 
             order = self.client.place_order(symbol, 'buy', qty)
-            if order:
-                # Try to use the *actual* filled price/fee (otherwise fee-only losses look like breakeven)
-                fill_price = float(signal['price'])
-                entry_fee = 0.0
-                try:
-                    txid = None
-                    if isinstance(order, dict) and order.get('txid'):
-                        txid_val = order.get('txid')
-                        txid = txid_val[0] if isinstance(txid_val, list) else txid_val
-                    if txid:
-                        time.sleep(2)  # allow Kraken to finalize order details
-                        info = self.client.get_order_info(txid)
-                        if info:
-                            fill = KrakenClient._extract_fill_price_and_fee(info)
-                            if fill.get('price', 0) > 0:
-                                fill_price = float(fill['price'])
-                            entry_fee = float(fill.get('fee', 0.0) or 0.0)
-                except Exception as _e:
-                    logger.debug(f"Could not fetch fill details for BUY {symbol}: {_e}")
+            if not order:
+                logger.error(f"BUY order failed for {symbol} - no order returned")
+                return
 
-                self.portfolio_tracker.record_entry(symbol, fill_price, qty, entry_fee)
-                self.positions[symbol] = {
-                    'symbol': symbol,
-                    'qty': qty,
-                    'avg_entry_price': fill_price,
-                    'current_price': fill_price,
-                    'unrealized_pl': 0,
-                    'unrealized_plpc': 0
-                }
+            # Try to use the *actual* filled price/fee (otherwise fee-only losses look like breakeven)
+            fill_price = float(signal['price'])
+            entry_fee = 0.0
+            try:
+                txid = None
+                if isinstance(order, dict) and order.get('txid'):
+                    txid_val = order.get('txid')
+                    txid = txid_val[0] if isinstance(txid_val, list) else txid_val
+                if txid:
+                    time.sleep(2)  # allow Kraken to finalize order details
+                    info = self.client.get_order_info(txid)
+                    if info:
+                        fill = KrakenClient._extract_fill_price_and_fee(info)
+                        if fill.get('price', 0) > 0:
+                            fill_price = float(fill['price'])
+                        entry_fee = float(fill.get('fee', 0.0) or 0.0)
+            except Exception as _e:
+                logger.debug(f"Could not fetch fill details for BUY {symbol}: {_e}")
 
-                # Add to dashboard
-                dashboard.add_trade({
-                    'symbol': symbol,
-                    'action': 'BUY',
-                    'qty': f"{qty:.4f}",
-                    'timestamp': datetime.now().isoformat()
-                })
+            self.portfolio_tracker.record_entry(symbol, fill_price, qty, entry_fee)
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'qty': qty,
+                'avg_entry_price': fill_price,
+                'current_price': fill_price,
+                'unrealized_pl': 0,
+                'unrealized_plpc': 0
+            }
 
-                # Update dashboard positions immediately
-                dashboard.update_positions(list(self.positions.values()))
+            # Add to dashboard
+            dashboard.add_trade({
+                'symbol': symbol,
+                'action': 'BUY',
+                'qty': f"{qty:.4f}",
+                'timestamp': datetime.now().isoformat()
+            })
 
-                logger.info(f"BUY {symbol}: {qty:.4f} @ ${fill_price:.6f}")
+            # Update dashboard positions immediately
+            dashboard.update_positions(list(self.positions.values()))
 
-                # Send Discord trade notification
-                self.discord_trading.send_trade_notification(
-                    trade_type='BUY',
-                    symbol=symbol,
-                    qty=qty,
-                    price=fill_price,
-                    strength=signal['strength'],
-                    confirmations=signal.get('confirmations', [])
-                )
+            logger.info(f"BUY {symbol}: {qty:.4f} @ ${fill_price:.6f}")
+
+            # Send Discord trade notification
+            self.discord_trading.send_trade_notification(
+                trade_type='BUY',
+                symbol=symbol,
+                qty=qty,
+                price=fill_price,
+                strength=signal['strength'],
+                confirmations=signal.get('confirmations', [])
+            )
 
         except Exception as e:
             logger.error(f"Failed to execute buy: {e}")
@@ -1034,58 +1084,73 @@ class TradingEngine:
             exit_fee = 0.0
 
             order = self.client.place_order(symbol, 'sell', qty)
-            if order:
-                # Try to use the actual filled exit price/fee
-                try:
-                    txid = None
-                    if isinstance(order, dict) and order.get('txid'):
-                        txid_val = order.get('txid')
-                        txid = txid_val[0] if isinstance(txid_val, list) else txid_val
-                    if txid:
-                        time.sleep(2)
-                        info = self.client.get_order_info(txid)
-                        if info:
-                            fill = KrakenClient._extract_fill_price_and_fee(info)
-                            if fill.get('price', 0) > 0:
-                                exit_price = float(fill['price'])
-                            exit_fee = float(fill.get('fee', 0.0) or 0.0)
-                except Exception as _e:
-                    logger.debug(f"Could not fetch fill details for SELL {symbol}: {_e}")
+            if not order:
+                logger.error(f"SELL order failed for {symbol} - no order returned")
+                return
 
-                trade = self.portfolio_tracker.record_exit(symbol, exit_price, qty, exit_fee)
+            # Try to use the actual filled exit price/fee
+            try:
+                txid = None
+                if isinstance(order, dict) and order.get('txid'):
+                    txid_val = order.get('txid')
+                    txid = txid_val[0] if isinstance(txid_val, list) else txid_val
+                if txid:
+                    time.sleep(2)
+                    info = self.client.get_order_info(txid)
+                    if info:
+                        fill = KrakenClient._extract_fill_price_and_fee(info)
+                        if fill.get('price', 0) > 0:
+                            exit_price = float(fill['price'])
+                        exit_fee = float(fill.get('fee', 0.0) or 0.0)
+            except Exception as _e:
+                logger.debug(f"Could not fetch fill details for SELL {symbol}: {_e}")
 
-                # Use net P/L (after fees) to determine win/loss
-                is_win = bool(trade and trade.get('pl', 0) > 0)
-                self.risk_manager.record_trade_result(is_win)
+            trade = self.portfolio_tracker.record_exit(symbol, exit_price, qty, exit_fee, entry_price_fallback=entry_price)
 
-                pl = float(trade.get('pl', 0.0) if trade else 0.0)
-                pl_percent = float(trade.get('pl_percent', 0.0) if trade else 0.0)
-
+            if not trade:
+                logger.error(f"Failed to record trade for {symbol} - trade recording returned None")
+                # Still remove position and update dashboard even if recording failed
                 del self.positions[symbol]
-
-                # Add to dashboard
                 dashboard.add_trade({
                     'symbol': symbol,
                     'action': 'SELL',
                     'qty': f"{qty:.4f}",
                     'timestamp': datetime.now().isoformat()
                 })
+                return
 
-                # Update dashboard stats immediately
-                stats = self.portfolio_tracker.get_daily_stats()
-                dashboard.update_daily_stats(stats)
+            # Use net P/L (after fees) to determine win/loss
+            is_win = bool(trade.get('pl', 0) > 0)
+            self.risk_manager.record_trade_result(is_win)
 
-                logger.info(f"SELL {symbol}: {qty:.4f} @ ${exit_price:.6f} - {'WIN' if is_win else 'LOSS'}")
+            pl = float(trade.get('pl', 0.0))
+            pl_percent = float(trade.get('pl_percent', 0.0))
 
-                # Send Discord position closed notification (net P/L)
-                self.discord_trading.send_position_closed(
-                    symbol=symbol,
-                    qty=qty,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    pl=pl,
-                    pl_percent=pl_percent
-                )
+            del self.positions[symbol]
+
+            # Add to dashboard
+            dashboard.add_trade({
+                'symbol': symbol,
+                'action': 'SELL',
+                'qty': f"{qty:.4f}",
+                'timestamp': datetime.now().isoformat()
+            })
+
+            # Update dashboard stats immediately
+            stats = self.portfolio_tracker.get_daily_stats()
+            dashboard.update_daily_stats(stats)
+
+            logger.info(f"SELL {symbol}: {qty:.4f} @ ${exit_price:.6f} - {'WIN' if is_win else 'LOSS'}")
+
+            # Send Discord position closed notification (net P/L)
+            self.discord_trading.send_position_closed(
+                symbol=symbol,
+                qty=qty,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pl=pl,
+                pl_percent=pl_percent
+            )
 
         except Exception as e:
             logger.error(f"Failed to execute sell: {e}")
@@ -1096,7 +1161,7 @@ class TradingEngine:
         if not self.positions:
             return
 
-        for symbol in list(self.positions.keys()):
+        for i, symbol in enumerate(list(self.positions.keys())):
             try:
                 current_price = self.client.get_ticker(symbol)
                 if current_price:
@@ -1119,6 +1184,11 @@ class TradingEngine:
                     self.positions[symbol]['unrealized_plpc'] = unrealized_plpc
 
                     logger.debug(f"Updated {symbol}: Qty={qty:.6f}, Entry=${entry_price:.6f}, Current=${current_price:.6f}, P/L=${unrealized_pl:.4f} ({unrealized_plpc:.2f}%)")
+
+                # Add a small delay between position updates to avoid rate limits
+                if i < len(self.positions) - 1:
+                    time.sleep(0.5)
+
             except Exception as e:
                 # Log at debug level to avoid spam if rate limited
                 logger.debug(f"Error updating price for {symbol}: {e}")
